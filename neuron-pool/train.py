@@ -58,7 +58,7 @@ class FastMultiLayerMLP(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(n_neurons, output_dim),
         )
-        
+
     def forward(self, x):
         return self.net(x)
     
@@ -804,5 +804,423 @@ def plot_comprehensive_results(individual_accs, random_pooled_accs, hybrid_accs,
 
 # Create comprehensive plots
 plot_comprehensive_results(individual_accuracies, random_pooled_accuracies, hybrid_accuracies)
+
+# %%
+# STEP 4: LLC (Learning Loss Complexity) Estimation
+print("\n" + "="*60)
+print("STEP 4: LLC ESTIMATION")
+print("="*60)
+
+from devinterp.slt.sampler import estimate_learning_coeff_with_summary
+from devinterp.slt.llc import LLCEstimator
+
+def estimate_llc_for_model(model, train_loader, device, n_samples=50, n_chains=4):
+    """Estimate LLC for a single model using the high-level devinterp API."""
+    print(f"Estimating LLC with {n_samples} samples and {n_chains} chains...")
+    
+    # Define evaluation function for devinterp
+    def eval_fn(model, batch):
+        """Evaluation function that returns loss for a batch (with gradients)."""
+        model.train()  # Need gradients for SGLD sampling
+        x, y = batch
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        x = x.view(x.size(0), -1)
+        
+        # Don't use torch.no_grad() - we need gradients for sampling
+        logits = model(x)
+        loss = nn.CrossEntropyLoss()(logits, y)
+        return loss
+    
+    try:
+        # Use the high-level API with proper evaluation function
+        results = estimate_learning_coeff_with_summary(
+            model=model,
+            loader=train_loader,
+            evaluate=eval_fn,  # Provide evaluation function
+            num_draws=n_samples,
+            num_chains=n_chains,
+            num_burnin_steps=max(100, n_samples * 2),  # Adequate burn-in
+            device=device,
+            optimizer_kwargs={
+                'lr': 1e-4,
+                'noise_level': 1.0,  # Proper SGLD
+                'weight_decay': 1e-4
+                # nbeta is handled automatically by the API
+            },
+            verbose=False
+        )
+        
+        # Extract LLC results
+        if results and 'llc/mean' in results:
+            llc_mean = results['llc/mean']
+            llc_std = results.get('llc/std', 0.0)
+            print(f"  LLC: {llc_mean:.4f} ± {llc_std:.4f}")
+            return llc_mean, llc_std, results
+        else:
+            print(f"  Warning: No valid LLC results in response")
+            print(f"  Available keys: {list(results.keys()) if results else 'None'}")
+            return float('nan'), float('nan'), {}
+            
+    except Exception as e:
+        print(f"  Detailed error: {str(e)}")
+        print(f"  Error type: {type(e).__name__}")
+        import traceback
+        print(f"  Traceback: {traceback.format_exc()}")
+        return float('nan'), float('nan'), {}
+
+def estimate_llc_for_all_models(models, train_loader, device, n_samples=50):
+    """Estimate LLC for all trained models."""
+    llc_results = []
+    llc_means = []
+    llc_stds = []
+    
+    print(f"Estimating LLC for {len(models)} individual models...")
+    
+    for i, model in enumerate(models):
+        print(f"\nModel {i+1}/{len(models)}:")
+        try:
+            llc_mean, llc_std, full_results = estimate_llc_for_model(
+                model, train_loader, device, n_samples=n_samples
+            )
+            llc_means.append(llc_mean)
+            llc_stds.append(llc_std)
+            llc_results.append(full_results)
+            print(f"  LLC: {llc_mean:.4f} ± {llc_std:.4f}")
+        except Exception as e:
+            print(f"  Error estimating LLC: {e}")
+            llc_means.append(float('nan'))
+            llc_stds.append(float('nan'))
+            llc_results.append({})
+    
+    return llc_means, llc_stds, llc_results
+
+def analyze_llc_results(llc_means, llc_stds, individual_accuracies):
+    """Analyze and visualize LLC results."""
+    import numpy as np
+    import matplotlib.pyplot as plt
+    
+    # Filter out NaN values
+    valid_indices = ~np.isnan(llc_means)
+    valid_llc_means = np.array(llc_means)[valid_indices]
+    valid_llc_stds = np.array(llc_stds)[valid_indices]
+    valid_accuracies = np.array(individual_accuracies)[valid_indices]
+    
+    if len(valid_llc_means) == 0:
+        print("No valid LLC estimates available for analysis.")
+        return
+    
+    print("\n" + "="*60)
+    print("LLC ANALYSIS RESULTS")
+    print("="*60)
+    
+    print(f"LLC Statistics:")
+    print(f"  Mean LLC: {np.mean(valid_llc_means):.4f} ± {np.std(valid_llc_means):.4f}")
+    print(f"  Min LLC:  {np.min(valid_llc_means):.4f}")
+    print(f"  Max LLC:  {np.max(valid_llc_means):.4f}")
+    print(f"  Range:    {np.max(valid_llc_means) - np.min(valid_llc_means):.4f}")
+    
+    # Check if models are in the same basin (similar LLC values)
+    llc_cv = np.std(valid_llc_means) / np.mean(valid_llc_means) if np.mean(valid_llc_means) != 0 else float('inf')
+    print(f"  Coefficient of Variation: {llc_cv:.4f}")
+    
+    if llc_cv < 0.1:
+        print("  → Models likely from the SAME basin (low LLC variance)")
+    elif llc_cv < 0.3:
+        print("  → Models possibly from similar basins (moderate LLC variance)")
+    else:
+        print("  → Models likely from DIFFERENT basins (high LLC variance)")
+    
+    # Plot LLC results
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Plot 1: LLC values for each model
+    ax1.bar(range(len(valid_llc_means)), valid_llc_means, yerr=valid_llc_stds, 
+            capsize=5, alpha=0.7, color='skyblue')
+    ax1.set_xlabel('Model Index')
+    ax1.set_ylabel('LLC')
+    ax1.set_title('LLC Estimates for Individual Models')
+    ax1.grid(True, alpha=0.3)
+    
+    # Add value labels
+    for i, (mean, std) in enumerate(zip(valid_llc_means, valid_llc_stds)):
+        ax1.text(i, mean + std + 0.01, f'{mean:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    # Plot 2: LLC vs Accuracy scatter
+    ax2.scatter(valid_accuracies, valid_llc_means, alpha=0.7, s=60, color='lightcoral')
+    ax2.set_xlabel('Test Accuracy')
+    ax2.set_ylabel('LLC')
+    ax2.set_title('LLC vs Test Accuracy')
+    ax2.grid(True, alpha=0.3)
+    
+    # Add correlation info
+    if len(valid_llc_means) > 2:
+        correlation = np.corrcoef(valid_accuracies, valid_llc_means)[0, 1]
+        ax2.text(0.05, 0.95, f'Correlation: {correlation:.3f}', transform=ax2.transAxes, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
+    # Plot 3: LLC distribution
+    ax3.hist(valid_llc_means, bins=min(10, len(valid_llc_means)), alpha=0.7, color='lightgreen')
+    ax3.axvline(np.mean(valid_llc_means), color='red', linestyle='--', 
+               label=f'Mean: {np.mean(valid_llc_means):.3f}')
+    ax3.set_xlabel('LLC')
+    ax3.set_ylabel('Frequency')
+    ax3.set_title('Distribution of LLC Values')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: LLC coefficient of variation comparison
+    ax4.bar(['LLC', 'Accuracy'], 
+           [llc_cv, np.std(valid_accuracies) / np.mean(valid_accuracies)],
+           color=['skyblue', 'lightcoral'], alpha=0.7)
+    ax4.set_ylabel('Coefficient of Variation')
+    ax4.set_title('Variability: LLC vs Accuracy')
+    ax4.grid(True, alpha=0.3)
+    
+    # Add value labels
+    for i, val in enumerate([llc_cv, np.std(valid_accuracies) / np.mean(valid_accuracies)]):
+        ax4.text(i, val + val*0.05, f'{val:.3f}', ha='center', va='bottom', fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig('llc_analysis_results.png', dpi=300, bbox_inches='tight')
+    print("\nLLC analysis plots saved as 'llc_analysis_results.png'")
+    plt.show()
+
+# Estimate LLC for all individual models
+print("Starting LLC estimation for individual models...")
+print("Note: This may take several minutes...")
+print("Using conservative parameters to avoid sampling issues...")
+
+# Use smaller, more conservative parameters for initial testing
+llc_means, llc_stds, llc_results = estimate_llc_for_all_models(
+    trained_models, train_loader, device, n_samples=20  # Reduced for stability
+)
+
+# Analyze the results
+analyze_llc_results(llc_means, llc_stds, individual_accuracies)
+
+# Store LLC results for potential further analysis
+llc_data = {
+    'llc_means': llc_means,
+    'llc_stds': llc_stds,
+    'individual_accuracies': individual_accuracies,
+    'full_results': llc_results
+}
+
+print(f"\nLLC estimation complete!")
+print(f"Results stored in 'llc_data' variable for further analysis.")
+
+# %%
+# STEP 5: LLC Analysis of Pooled Models
+print("\n" + "="*60)
+print("STEP 5: LLC ANALYSIS OF POOLED MODELS")
+print("="*60)
+
+def estimate_pooled_model_llcs(neuron_pool, device, n_test_models=5, n_samples=20):
+    """Estimate LLC for pooled models and analyze neuron contribution correlations."""
+    
+    print(f"Estimating LLC for {n_test_models} pooled models...")
+    
+    pooled_llc_data = []
+    pooled_models_info = []
+    
+    for i in range(n_test_models):
+        print(f"\nPooled Model {i+1}/{n_test_models}:")
+        
+        # Create random pooled model
+        pooled_model, selected_indices = create_random_pooled_model(
+            neuron_pool, device, seed=3000+i
+        )
+        
+        # Estimate LLC for this pooled model
+        llc_mean, llc_std, llc_results = estimate_llc_for_model(
+            pooled_model, train_loader, device, n_samples=n_samples
+        )
+        
+        # Calculate weighted LLC contribution from source models
+        neuron_contributions = calculate_neuron_contributions(
+            selected_indices, llc_means, len(trained_models)
+        )
+        
+        pooled_llc_data.append({
+            'model_idx': i,
+            'llc_mean': llc_mean,
+            'llc_std': llc_std,
+            'selected_indices': selected_indices,
+            'neuron_contributions': neuron_contributions,
+            'accuracy': evaluate(pooled_model, test_loader, device)
+        })
+        
+        pooled_models_info.append(pooled_model)
+        
+        print(f"  Pooled LLC: {llc_mean:.4f} ± {llc_std:.4f}")
+        print(f"  Expected LLC (weighted): {neuron_contributions['weighted_llc']:.4f}")
+        print(f"  LLC difference: {llc_mean - neuron_contributions['weighted_llc']:.4f}")
+    
+    return pooled_llc_data, pooled_models_info
+
+def calculate_neuron_contributions(selected_indices, source_llcs, n_source_models):
+    """Calculate weighted LLC contribution from source models."""
+    
+    # Convert to numpy for easier manipulation
+    selected_indices_np = selected_indices.cpu().numpy()
+    n_neurons_per_model = 256  # Each source model has 256 neurons
+    
+    # Count how many neurons come from each source model
+    source_counts = np.zeros(n_source_models)
+    source_llcs_valid = []
+    
+    for idx in selected_indices_np:
+        source_model_idx = idx // n_neurons_per_model
+        if source_model_idx < n_source_models:
+            source_counts[source_model_idx] += 1
+    
+    # Calculate weighted LLC based on neuron distribution
+    total_neurons = len(selected_indices_np)
+    weighted_llc = 0.0
+    valid_contribution = 0.0
+    
+    for i, (count, source_llc) in enumerate(zip(source_counts, source_llcs)):
+        if not np.isnan(source_llc) and count > 0:
+            weight = count / total_neurons
+            contribution = weight * source_llc
+            weighted_llc += contribution
+            valid_contribution += weight
+            
+    # Normalize if not all source models had valid LLCs
+    if valid_contribution > 0:
+        weighted_llc = weighted_llc / valid_contribution * (valid_contribution)
+    
+    return {
+        'source_counts': source_counts,
+        'source_weights': source_counts / total_neurons,
+        'weighted_llc': weighted_llc,
+        'valid_contribution': valid_contribution,
+        'neuron_diversity': np.sum(source_counts > 0) / n_source_models  # Fraction of source models used
+    }
+
+def analyze_llc_correlations(pooled_llc_data, individual_llc_means):
+    """Analyze correlations between LLC differences and neuron contributions."""
+    
+    print("\n" + "="*60)
+    print("LLC CORRELATION ANALYSIS")
+    print("="*60)
+    
+    # Extract data for correlation analysis
+    pooled_llcs = [data['llc_mean'] for data in pooled_llc_data if not np.isnan(data['llc_mean'])]
+    weighted_llcs = [data['neuron_contributions']['weighted_llc'] for data in pooled_llc_data if not np.isnan(data['llc_mean'])]
+    llc_differences = [pooled - weighted for pooled, weighted in zip(pooled_llcs, weighted_llcs)]
+    neuron_diversities = [data['neuron_contributions']['neuron_diversity'] for data in pooled_llc_data if not np.isnan(data['llc_mean'])]
+    pooled_accuracies = [data['accuracy'] for data in pooled_llc_data if not np.isnan(data['llc_mean'])]
+    
+    if len(pooled_llcs) == 0:
+        print("No valid pooled LLC estimates for correlation analysis.")
+        return
+    
+    print(f"Valid pooled models for analysis: {len(pooled_llcs)}")
+    
+    # Statistical analysis
+    print(f"\nStatistical Summary:")
+    print(f"Pooled LLCs: {np.mean(pooled_llcs):.4f} ± {np.std(pooled_llcs):.4f}")
+    print(f"Weighted LLCs: {np.mean(weighted_llcs):.4f} ± {np.std(weighted_llcs):.4f}")
+    print(f"LLC differences: {np.mean(llc_differences):.4f} ± {np.std(llc_differences):.4f}")
+    print(f"Neuron diversity: {np.mean(neuron_diversities):.4f} ± {np.std(neuron_diversities):.4f}")
+    
+    # Correlation analysis
+    correlations = {}
+    if len(pooled_llcs) > 2:
+        correlations['llc_diff_vs_diversity'] = np.corrcoef(llc_differences, neuron_diversities)[0, 1]
+        correlations['pooled_vs_weighted'] = np.corrcoef(pooled_llcs, weighted_llcs)[0, 1]
+        correlations['llc_diff_vs_accuracy'] = np.corrcoef(llc_differences, pooled_accuracies)[0, 1]
+        
+        print(f"\nCorrelations:")
+        print(f"LLC difference vs Neuron diversity: {correlations['llc_diff_vs_diversity']:.4f}")
+        print(f"Pooled vs Weighted LLC: {correlations['pooled_vs_weighted']:.4f}")
+        print(f"LLC difference vs Accuracy: {correlations['llc_diff_vs_accuracy']:.4f}")
+    
+    # Create comprehensive plots
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Plot 1: Pooled vs Weighted LLC
+    ax1.scatter(weighted_llcs, pooled_llcs, alpha=0.7, s=80, color='skyblue')
+    ax1.plot([min(weighted_llcs + pooled_llcs), max(weighted_llcs + pooled_llcs)], 
+             [min(weighted_llcs + pooled_llcs), max(weighted_llcs + pooled_llcs)], 
+             'r--', alpha=0.5, label='Perfect Agreement')
+    ax1.set_xlabel('Weighted LLC (Expected)')
+    ax1.set_ylabel('Pooled LLC (Actual)')
+    ax1.set_title('Pooled vs Expected LLC')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    if len(pooled_llcs) > 2:
+        ax1.text(0.05, 0.95, f'R = {correlations["pooled_vs_weighted"]:.3f}', 
+                transform=ax1.transAxes, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
+    # Plot 2: LLC Difference vs Neuron Diversity
+    ax2.scatter(neuron_diversities, llc_differences, alpha=0.7, s=80, color='lightcoral')
+    ax2.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    ax2.set_xlabel('Neuron Diversity (Fraction of Source Models Used)')
+    ax2.set_ylabel('LLC Difference (Actual - Expected)')
+    ax2.set_title('LLC Deviation vs Neuron Mixing')
+    ax2.grid(True, alpha=0.3)
+    
+    if len(pooled_llcs) > 2:
+        ax2.text(0.05, 0.95, f'R = {correlations["llc_diff_vs_diversity"]:.3f}', 
+                transform=ax2.transAxes, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
+    # Plot 3: LLC Difference vs Accuracy
+    ax3.scatter(pooled_accuracies, llc_differences, alpha=0.7, s=80, color='lightgreen')
+    ax3.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    ax3.set_xlabel('Pooled Model Accuracy')
+    ax3.set_ylabel('LLC Difference (Actual - Expected)')
+    ax3.set_title('LLC Deviation vs Performance')
+    ax3.grid(True, alpha=0.3)
+    
+    if len(pooled_llcs) > 2:
+        ax3.text(0.05, 0.95, f'R = {correlations["llc_diff_vs_accuracy"]:.3f}', 
+                transform=ax3.transAxes, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
+    # Plot 4: Source Model Contribution Heatmap
+    ax4.set_title('Neuron Source Distribution Across Pooled Models')
+    if len(pooled_llc_data) > 0:
+        # Create heatmap of source contributions
+        contribution_matrix = np.array([data['neuron_contributions']['source_weights'] 
+                                      for data in pooled_llc_data if not np.isnan(data['llc_mean'])])
+        
+        if contribution_matrix.size > 0:
+            im = ax4.imshow(contribution_matrix, cmap='YlOrRd', aspect='auto')
+            ax4.set_xlabel('Source Model Index')
+            ax4.set_ylabel('Pooled Model Index')
+            plt.colorbar(im, ax=ax4, label='Fraction of Neurons')
+        else:
+            ax4.text(0.5, 0.5, 'No valid data', transform=ax4.transAxes, ha='center', va='center')
+    
+    plt.tight_layout()
+    plt.savefig('llc_correlation_analysis.png', dpi=300, bbox_inches='tight')
+    print("\nCorrelation analysis plots saved as 'llc_correlation_analysis.png'")
+    plt.show()
+    
+    return correlations, llc_differences, neuron_diversities
+
+# Run LLC analysis for pooled models
+print("Estimating LLCs for pooled models...")
+pooled_llc_data, pooled_models_info = estimate_pooled_model_llcs(
+    neuron_pool, device, n_test_models=5, n_samples=15  # Reduced for speed
+)
+
+# Analyze correlations
+correlations, llc_diffs, diversities = analyze_llc_correlations(pooled_llc_data, llc_means)
+
+# Store comprehensive results
+comprehensive_llc_data = {
+    'individual_llcs': llc_data,
+    'pooled_llcs': pooled_llc_data,
+    'correlations': correlations,
+    'llc_differences': llc_diffs,
+    'neuron_diversities': diversities
+}
+
+print(f"\nComprehensive LLC analysis complete!")
+print(f"Results stored in 'comprehensive_llc_data' variable.")
 
 # %%
