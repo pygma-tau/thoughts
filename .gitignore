@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+
+# Python bytecode and caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments (per-project)
+.venv/
+**/.venv/
+venv/
+**/venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test/coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints
+**/.ipynb_checkpoints
+
+# Editors/IDE
+.vscode/
+.idea/
+
+# Note: keep `.python-version` tracked per subproject to pin Python version
+
+# Data
+neuron-pool/data/
+data/
