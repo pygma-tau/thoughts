@@ -6,7 +6,7 @@ I overheard Lucas Teixeira claiming that when you use SGLD to sample a family of
 
 We do not find evidence of this phenomenon, perhaps the experimental setup should be different (or perhaps we're not all sampling from the same basin)
 
-LLCs do differ from pretrained model to pretrained model, so perhaps they're not all in the same basin? 
+LLCs do differ from pretrained model to pretrained model, so perhaps they're not all in the same basin? (I'm also pretty sure that LLC < 1/2, so these estimates are quite off)
 
 ![Comprehensive Neuron Pooling Results](comprehensive_neuron_pooling_results.png)
 
